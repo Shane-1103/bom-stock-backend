@@ -20,6 +20,7 @@ app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 const pool = mysql.createPool({
   host: process.env.DB_HOST || "localhost",
+  port: Number(process.env.DB_PORT || 3306),
   user: process.env.DB_USER || "root",
   password: process.env.DB_PASSWORD || "",
   database: process.env.DB_NAME || "bom_stock_app",
@@ -70,6 +71,15 @@ function requirePermission(permission) {
 }
 
 app.get("/api/health", (req, res) => res.json({ ok: true, app: "BOM Stock App API" }));
+
+app.get("/api/db-test", async (req, res) => {
+  try {
+    const rows = await query("SELECT 1 AS ok");
+    res.json({ ok: true, db: rows[0] });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
 // AUTH
 app.post("/api/auth/register", async (req, res) => {
