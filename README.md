@@ -37,3 +37,10 @@ DB_PORT=35611
 
 Test DB:
 https://your-render-url.onrender.com/api/db-test
+
+
+## Auto database setup
+After deploy, open:
+https://your-render-url.onrender.com/api/setup-db
+
+This creates all required tables automatically.

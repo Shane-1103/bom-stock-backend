@@ -81,6 +81,187 @@ app.get("/api/db-test", async (req, res) => {
   }
 });
 
+
+app.get("/api/setup-db", async (req, res) => {
+  try {
+    const statements = [
+      `CREATE TABLE IF NOT EXISTS users (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(120) NOT NULL,
+        email VARCHAR(180) NOT NULL UNIQUE,
+        password_hash VARCHAR(255) NOT NULL,
+        role ENUM('OWNER', 'ADMIN', 'SALES', 'WAREHOUSE', 'STAFF') NOT NULL DEFAULT 'STAFF',
+        status ENUM('ACTIVE', 'INACTIVE') NOT NULL DEFAULT 'ACTIVE',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS warehouses (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(120) NOT NULL,
+        code VARCHAR(50) NOT NULL UNIQUE,
+        address TEXT NULL,
+        status ENUM('ACTIVE', 'INACTIVE') NOT NULL DEFAULT 'ACTIVE',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS products (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        sku VARCHAR(100) NOT NULL UNIQUE,
+        name VARCHAR(180) NOT NULL,
+        category VARCHAR(120) NULL,
+        price DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        cost DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        image_url VARCHAR(500) NULL,
+        is_component BOOLEAN NOT NULL DEFAULT FALSE,
+        status ENUM('ACTIVE', 'INACTIVE') NOT NULL DEFAULT 'ACTIVE',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS bom_items (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        product_id BIGINT UNSIGNED NOT NULL,
+        component_product_id BIGINT UNSIGNED NOT NULL,
+        quantity DECIMAL(12,3) NOT NULL DEFAULT 1.000,
+        unit VARCHAR(40) NOT NULL DEFAULT 'pcs',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_bom_product_id (product_id),
+        INDEX idx_bom_component_product_id (component_product_id)
+      )`,
+      `CREATE TABLE IF NOT EXISTS inventory (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        product_id BIGINT UNSIGNED NOT NULL,
+        warehouse_id BIGINT UNSIGNED NOT NULL,
+        qty_on_hand DECIMAL(12,3) NOT NULL DEFAULT 0.000,
+        qty_reserved DECIMAL(12,3) NOT NULL DEFAULT 0.000,
+        qty_available DECIMAL(12,3) GENERATED ALWAYS AS (qty_on_hand - qty_reserved) STORED,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY unique_product_warehouse (product_id, warehouse_id)
+      )`,
+      `CREATE TABLE IF NOT EXISTS stock_movements (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        product_id BIGINT UNSIGNED NOT NULL,
+        from_warehouse_id BIGINT UNSIGNED NULL,
+        to_warehouse_id BIGINT UNSIGNED NULL,
+        qty DECIMAL(12,3) NOT NULL,
+        type ENUM('IN', 'OUT', 'TRANSFER', 'ADJUSTMENT', 'ORDER_RESERVED', 'ORDER_RELEASED') NOT NULL,
+        reference_no VARCHAR(120) NULL,
+        remark TEXT NULL,
+        created_by BIGINT UNSIGNED NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS orders (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        order_id VARCHAR(120) NOT NULL UNIQUE,
+        order_type ENUM('SALESMAN SO', 'SHOPEE', 'TIKTOK', 'OTHER') NOT NULL,
+        shop_name VARCHAR(180) NULL,
+        customer_name VARCHAR(180) NULL,
+        status ENUM('Draft', 'Pending', 'Confirmed', 'Packed', 'Partial Shipped', 'Shipped', 'Completed', 'Cancelled') NOT NULL DEFAULT 'Pending',
+        deadline_ship_date DATE NULL,
+        warehouse_id BIGINT UNSIGNED NULL,
+        total DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        remark TEXT NULL,
+        created_by BIGINT UNSIGNED NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS order_items (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        order_id BIGINT UNSIGNED NOT NULL,
+        product_id BIGINT UNSIGNED NOT NULL,
+        qty DECIMAL(12,3) NOT NULL DEFAULT 1.000,
+        price DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        remark TEXT NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS order_shipments (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        order_id BIGINT UNSIGNED NOT NULL,
+        tracking_number VARCHAR(180) NOT NULL,
+        ship_date DATE NOT NULL,
+        ship_time TIME NOT NULL,
+        shipped_qty DECIMAL(12,3) NOT NULL DEFAULT 0.000,
+        courier VARCHAR(120) NULL,
+        created_by BIGINT UNSIGNED NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS order_item_media (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        order_item_id BIGINT UNSIGNED NOT NULL,
+        media_type ENUM('photo', 'video') NOT NULL,
+        file_url VARCHAR(500) NOT NULL,
+        file_name VARCHAR(255) NULL,
+        file_size BIGINT UNSIGNED NULL,
+        mime_type VARCHAR(120) NULL,
+        uploaded_by BIGINT UNSIGNED NULL,
+        uploaded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS shipment_reports (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        report_no VARCHAR(120) NOT NULL UNIQUE,
+        date_from DATE NULL,
+        date_to DATE NULL,
+        order_type ENUM('SALESMAN SO', 'SHOPEE', 'TIKTOK', 'OTHER') NULL,
+        shop_name VARCHAR(180) NULL,
+        generated_by BIGINT UNSIGNED NULL,
+        generated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS chat_rooms (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        room_name VARCHAR(180) NOT NULL,
+        room_type ENUM('GENERAL', 'ORDER', 'WAREHOUSE') NOT NULL DEFAULT 'GENERAL',
+        order_id BIGINT UNSIGNED NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS chat_messages (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        room_id BIGINT UNSIGNED NOT NULL,
+        sender_id BIGINT UNSIGNED NULL,
+        message TEXT NOT NULL,
+        attachment_url VARCHAR(500) NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS audit_logs (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        user_id BIGINT UNSIGNED NULL,
+        action VARCHAR(120) NOT NULL,
+        module VARCHAR(120) NOT NULL,
+        record_id VARCHAR(120) NULL,
+        before_json JSON NULL,
+        after_json JSON NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`
+    ];
+
+    for (const sql of statements) {
+      await pool.execute(sql);
+    }
+
+    await pool.execute(`INSERT IGNORE INTO warehouses (name, code, address) VALUES
+      ('Main Warehouse', 'MAIN', 'Main stock location'),
+      ('Johor Warehouse', 'JHR', 'Johor branch warehouse'),
+      ('Penang Warehouse', 'PNG', 'Penang branch warehouse')`);
+
+    await pool.execute(`INSERT IGNORE INTO products (sku, name, category, price, cost, is_component) VALUES
+      ('BRK-DISC-01', 'Racing Brake Disc', 'Motor Parts', 180.00, 95.00, FALSE),
+      ('SOB-JERSEY-BKOR', 'SOB Racing Jersey', 'Apparel', 89.00, 38.00, FALSE),
+      ('CARE-CHAIN-01', 'Chain Cleaner Kit', 'Maintenance', 45.00, 20.00, FALSE),
+      ('COMP-STEEL-PLATE', 'Steel Plate', 'Component', 25.00, 18.00, TRUE),
+      ('COMP-DRYFIT-FABRIC', 'Dry Fit Fabric', 'Component', 18.00, 12.00, TRUE)`);
+
+    await pool.execute(`INSERT IGNORE INTO inventory (product_id, warehouse_id, qty_on_hand, qty_reserved)
+      SELECT p.id, w.id, 0, 0 FROM products p CROSS JOIN warehouses w`);
+
+    const tables = await query("SHOW TABLES");
+    res.json({ ok: true, message: "Database setup completed", tables });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+
 // AUTH
 app.post("/api/auth/register", async (req, res) => {
   try {
