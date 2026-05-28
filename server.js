@@ -96,6 +96,16 @@ app.get("/api/setup-db", async (req, res) => {
         updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )`,
 
+      `CREATE TABLE IF NOT EXISTS sales_agents (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(180) NOT NULL,
+        phone VARCHAR(80) NULL,
+        email VARCHAR(180) NULL,
+        remark TEXT NULL,
+        status ENUM('ACTIVE', 'INACTIVE') NOT NULL DEFAULT 'ACTIVE',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )`,
       `CREATE TABLE IF NOT EXISTS customers (
         id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         customer_code VARCHAR(80) NULL UNIQUE,
@@ -104,6 +114,7 @@ app.get("/api/setup-db", async (req, res) => {
         email VARCHAR(180) NULL,
         address TEXT NULL,
         platform ENUM('GENERAL', 'SHOPEE', 'TIKTOK', 'SALESMAN', 'OTHER') NOT NULL DEFAULT 'GENERAL',
+        sales_agent_id BIGINT UNSIGNED NULL,
         shop_name VARCHAR(180) NULL,
         remark TEXT NULL,
         status ENUM('ACTIVE', 'INACTIVE') NOT NULL DEFAULT 'ACTIVE',
@@ -315,6 +326,13 @@ app.get("/api/setup-db", async (req, res) => {
       ('Cancelled', 7, FALSE)`);
 
 
+
+    try {
+      await pool.execute("ALTER TABLE customers ADD COLUMN sales_agent_id BIGINT UNSIGNED NULL AFTER platform");
+    } catch (e) {
+      if (!String(e.message).includes("Duplicate column")) throw e;
+    }
+
     const uniqueIndexStatements = [
       "CREATE UNIQUE INDEX unique_order_so_number ON orders (so_number)",
       "CREATE UNIQUE INDEX unique_order_tracking_number ON orders (tracking_number)"
@@ -382,6 +400,43 @@ app.post("/api/auth/login", async (req, res) => {
 app.get("/api/auth/me", authRequired, (req,res) => res.json({ user:req.user, permissions:ROLE_PERMISSIONS[req.user.role] || [] }));
 
 
+
+// SALES AGENTS
+app.get("/api/sales-agents", authRequired, requirePermission("orders:read"), async (req, res) => {
+  try {
+    const { status = "ACTIVE" } = req.query;
+    const rows = await query(
+      `SELECT * FROM sales_agents ${status && status !== "ALL" ? "WHERE status=?" : ""} ORDER BY name ASC`,
+      status && status !== "ALL" ? [status] : []
+    );
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/api/sales-agents", authRequired, requirePermission("orders:create"), async (req, res) => {
+  try {
+    const { name, phone, email, remark, status = "ACTIVE" } = req.body;
+    if (!name) return res.status(400).json({ error: "Sales agent name is required" });
+    const [result] = await pool.execute(
+      "INSERT INTO sales_agents (name, phone, email, remark, status) VALUES (?, ?, ?, ?, ?)",
+      [name, phone || null, email || null, remark || null, status]
+    );
+    res.json({ success: true, id: result.insertId });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put("/api/sales-agents/:id", authRequired, requirePermission("orders:update"), async (req, res) => {
+  try {
+    const { name, phone, email, remark, status = "ACTIVE" } = req.body;
+    await pool.execute(
+      "UPDATE sales_agents SET name=?, phone=?, email=?, remark=?, status=? WHERE id=?",
+      [name, phone || null, email || null, remark || null, status, req.params.id]
+    );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
 // CUSTOMERS
 app.get("/api/customers", authRequired, requirePermission("orders:read"), async (req, res) => {
   try {
@@ -389,19 +444,19 @@ app.get("/api/customers", authRequired, requirePermission("orders:read"), async 
     const where = [];
     const params = [];
     if (q) {
-      where.push("(customer_code LIKE ? OR name LIKE ? OR phone LIKE ? OR email LIKE ? OR shop_name LIKE ?)");
+      where.push("(c.customer_code LIKE ? OR c.name LIKE ? OR c.phone LIKE ? OR c.email LIKE ? OR c.shop_name LIKE ?)");
       params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
     }
     if (platform && platform !== "ALL") {
-      where.push("platform = ?");
+      where.push("c.platform = ?");
       params.push(platform);
     }
     if (status && status !== "ALL") {
-      where.push("status = ?");
+      where.push("c.status = ?");
       params.push(status);
     }
     const rows = await query(
-      `SELECT * FROM customers ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY created_at DESC LIMIT 300`,
+      `SELECT c.*, sa.name AS sales_agent_name FROM customers c LEFT JOIN sales_agents sa ON sa.id=c.sales_agent_id ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY c.created_at DESC LIMIT 300`,
       params
     );
     res.json(rows);
@@ -412,12 +467,12 @@ app.get("/api/customers", authRequired, requirePermission("orders:read"), async 
 
 app.post("/api/customers", authRequired, requirePermission("orders:create"), async (req, res) => {
   try {
-    const { customer_code, name, phone, email, address, platform = "GENERAL", shop_name, remark } = req.body;
+    const { customer_code, name, phone, email, address, platform = "GENERAL", sales_agent_id, shop_name, remark, status = "ACTIVE" } = req.body;
     if (!name) return res.status(400).json({ error: "Customer name is required" });
     const [result] = await pool.execute(
-      `INSERT INTO customers (customer_code, name, phone, email, address, platform, shop_name, remark)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [customer_code || null, name, phone || null, email || null, address || null, platform, shop_name || null, remark || null]
+      `INSERT INTO customers (customer_code, name, phone, email, address, platform, sales_agent_id, shop_name, remark, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [customer_code || null, name, phone || null, email || null, address || null, platform, sales_agent_id || null, shop_name || null, remark || null, status]
     );
     res.json({ success: true, id: result.insertId });
   } catch (err) {
@@ -428,10 +483,10 @@ app.post("/api/customers", authRequired, requirePermission("orders:create"), asy
 
 app.put("/api/customers/:id", authRequired, requirePermission("orders:update"), async (req, res) => {
   try {
-    const { customer_code, name, phone, email, address, platform = "GENERAL", shop_name, remark, status = "ACTIVE" } = req.body;
+    const { customer_code, name, phone, email, address, platform = "GENERAL", sales_agent_id, shop_name, remark, status = "ACTIVE" } = req.body;
     await pool.execute(
-      `UPDATE customers SET customer_code=?, name=?, phone=?, email=?, address=?, platform=?, shop_name=?, remark=?, status=? WHERE id=?`,
-      [customer_code || null, name, phone || null, email || null, address || null, platform, shop_name || null, remark || null, status, req.params.id]
+      `UPDATE customers SET customer_code=?, name=?, phone=?, email=?, address=?, platform=?, sales_agent_id=?, shop_name=?, remark=?, status=? WHERE id=?`,
+      [customer_code || null, name, phone || null, email || null, address || null, platform, sales_agent_id || null, shop_name || null, remark || null, status, req.params.id]
     );
     res.json({ success: true });
   } catch (err) {
