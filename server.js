@@ -11,6 +11,18 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 
 const app = express();
+
+const uploadDir = path.join(__dirname, "uploads");
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadDir),
+  filename: (req, file, cb) => {
+    const safeName = String(file.originalname || "file").replace(/[^a-zA-Z0-9._-]/g, "_");
+    cb(null, Date.now() + "-" + Math.round(Math.random() * 1e9) + "-" + safeName);
+  }
+});
+const upload = multer({ storage });
+
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || "change-this-secret-key";
 
