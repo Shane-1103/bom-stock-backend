@@ -135,6 +135,9 @@ app.get("/api/setup-db", async (req, res) => {
         sku VARCHAR(100) NOT NULL UNIQUE,
         name VARCHAR(180) NOT NULL,
         category VARCHAR(120) NULL,
+        vehicle_model VARCHAR(120) NULL,
+        sticker_code VARCHAR(120) NULL,
+        cover_color VARCHAR(120) NULL,
         price DECIMAL(12,2) NOT NULL DEFAULT 0.00,
         cost DECIMAL(12,2) NOT NULL DEFAULT 0.00,
         image_url VARCHAR(500) NULL,
@@ -178,6 +181,41 @@ app.get("/api/setup-db", async (req, res) => {
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
       )`,
 
+
+      `CREATE TABLE IF NOT EXISTS vehicle_models (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(120) NOT NULL UNIQUE,
+        remark TEXT NULL,
+        status ENUM('ACTIVE', 'INACTIVE') NOT NULL DEFAULT 'ACTIVE',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS sticker_codes (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        code VARCHAR(120) NOT NULL UNIQUE,
+        name VARCHAR(180) NULL,
+        remark TEXT NULL,
+        status ENUM('ACTIVE', 'INACTIVE') NOT NULL DEFAULT 'ACTIVE',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS cover_colors (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(120) NOT NULL UNIQUE,
+        color_code VARCHAR(80) NULL,
+        remark TEXT NULL,
+        status ENUM('ACTIVE', 'INACTIVE') NOT NULL DEFAULT 'ACTIVE',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS product_categories (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(120) NOT NULL UNIQUE,
+        remark TEXT NULL,
+        status ENUM('ACTIVE', 'INACTIVE') NOT NULL DEFAULT 'ACTIVE',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )`,
       `CREATE TABLE IF NOT EXISTS promotions (
         id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         promo_code VARCHAR(100) NOT NULL UNIQUE,
@@ -342,6 +380,21 @@ app.get("/api/setup-db", async (req, res) => {
       if (!String(e.message).includes("Duplicate column")) throw e;
     }
 
+
+    const productVariantAlterStatements = [
+      "ALTER TABLE products ADD COLUMN vehicle_model VARCHAR(120) NULL AFTER category",
+      "ALTER TABLE products ADD COLUMN sticker_code VARCHAR(120) NULL AFTER vehicle_model",
+      "ALTER TABLE products ADD COLUMN cover_color VARCHAR(120) NULL AFTER sticker_code"
+    ];
+    for (const sql of productVariantAlterStatements) {
+      try {
+        await pool.execute(sql);
+      } catch (e) {
+        const msg = String(e.message || "");
+        if (!msg.includes("Duplicate column")) throw e;
+      }
+    }
+
     const orderV2AlterStatements = [
       "ALTER TABLE orders ADD COLUMN order_date DATE NOT NULL DEFAULT (CURRENT_DATE) AFTER order_id",
       "ALTER TABLE orders ADD COLUMN so_number VARCHAR(120) NULL AFTER order_date",
@@ -392,6 +445,12 @@ app.get("/api/setup-db", async (req, res) => {
         }
       }
     }
+
+
+    await pool.execute(`INSERT IGNORE INTO vehicle_models (name) VALUES ('Y15ZR'), ('LC135'), ('RS150'), ('NVX')`);
+    await pool.execute(`INSERT IGNORE INTO sticker_codes (code, name) VALUES ('RX01','RX01'), ('RX02','RX02'), ('THAI01','THAI01')`);
+    await pool.execute(`INSERT IGNORE INTO cover_colors (name) VALUES ('Black'), ('Red'), ('Blue'), ('Silver'), ('Orange')`);
+    await pool.execute(`INSERT IGNORE INTO product_categories (name) VALUES ('Sticker'), ('Cover Set'), ('Jersey'), ('Motor Parts')`);
 
     await pool.execute(`INSERT IGNORE INTO warehouses (name, code, address) VALUES
       ('Main Warehouse', 'MAIN', 'Main stock location'),
@@ -540,6 +599,68 @@ app.put("/api/customers/:id", authRequired, requirePermission("orders:update"), 
 });
 
 
+
+
+
+// PRODUCT VARIANT OPTIONS
+function registerOptionRoutes(basePath, table, codeField = "name") {
+  app.get(`/api/${basePath}`, authRequired, requirePermission("products:read"), async (req, res) => {
+    try {
+      const { status = "ACTIVE" } = req.query;
+      const rows = await query(
+        `SELECT * FROM ${table} ${status && status !== "ALL" ? "WHERE status=?" : ""} ORDER BY ${codeField} ASC`,
+        status && status !== "ALL" ? [status] : []
+      );
+      res.json(rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  app.post(`/api/${basePath}`, authRequired, requirePermission("products:create"), async (req, res) => {
+    try {
+      const { name, code, color_code, remark, status = "ACTIVE" } = req.body;
+      let sql, params;
+      if (table === "sticker_codes") {
+        sql = "INSERT INTO sticker_codes (code, name, remark, status) VALUES (?, ?, ?, ?)";
+        params = [code || name, name || code, remark || null, status];
+      } else if (table === "cover_colors") {
+        sql = "INSERT INTO cover_colors (name, color_code, remark, status) VALUES (?, ?, ?, ?)";
+        params = [name, color_code || null, remark || null, status];
+      } else {
+        sql = `INSERT INTO ${table} (name, remark, status) VALUES (?, ?, ?)`;
+        params = [name, remark || null, status];
+      }
+      const [result] = await pool.execute(sql, params);
+      res.json({ success: true, id: result.insertId });
+    } catch (err) {
+      if (err.code === "ER_DUP_ENTRY") return res.status(409).json({ error: "Option already exists" });
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.put(`/api/${basePath}/:id`, authRequired, requirePermission("products:update"), async (req, res) => {
+    try {
+      const { name, code, color_code, remark, status = "ACTIVE" } = req.body;
+      let sql, params;
+      if (table === "sticker_codes") {
+        sql = "UPDATE sticker_codes SET code=?, name=?, remark=?, status=? WHERE id=?";
+        params = [code || name, name || code, remark || null, status, req.params.id];
+      } else if (table === "cover_colors") {
+        sql = "UPDATE cover_colors SET name=?, color_code=?, remark=?, status=? WHERE id=?";
+        params = [name, color_code || null, remark || null, status, req.params.id];
+      } else {
+        sql = `UPDATE ${table} SET name=?, remark=?, status=? WHERE id=?`;
+        params = [name, remark || null, status, req.params.id];
+      }
+      await pool.execute(sql, params);
+      res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+}
+
+registerOptionRoutes("vehicle-models", "vehicle_models", "name");
+registerOptionRoutes("sticker-codes", "sticker_codes", "code");
+registerOptionRoutes("cover-colors", "cover_colors", "name");
+registerOptionRoutes("product-categories", "product_categories", "name");
 
 
 // PROMOTIONS
@@ -907,8 +1028,8 @@ app.get("/api/products", authRequired, requirePermission("products:read"), async
 });
 app.post("/api/products", authRequired, requirePermission("products:create"), async (req,res) => {
   try {
-    const { sku,name,category,price=0,cost=0,image_url,is_component=false } = req.body;
-    const [r]=await pool.execute("INSERT INTO products (sku,name,category,price,cost,image_url,is_component) VALUES (?,?,?,?,?,?,?)",[sku,name,category||null,price,cost,image_url||null,is_component?1:0]);
+    const { sku,name,category,vehicle_model,sticker_code,cover_color,price=0,cost=0,image_url,is_component=false } = req.body;
+    const [r]=await pool.execute("INSERT INTO products (sku,name,category,vehicle_model,sticker_code,cover_color,price,cost,image_url,is_component) VALUES (?,?,?,?,?,?,?,?,?,?)",[sku,name,category||null,vehicle_model||null,sticker_code||null,cover_color||null,price,cost,image_url||null,is_component?1:0]);
     await pool.execute("INSERT IGNORE INTO inventory (product_id,warehouse_id,qty_on_hand,qty_reserved) SELECT ?, id, 0, 0 FROM warehouses WHERE status='ACTIVE'", [r.insertId]);
     res.json({success:true,id:r.insertId});
   } catch(err){ res.status(500).json({error:err.message});}
