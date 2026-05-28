@@ -177,6 +177,43 @@ app.get("/api/setup-db", async (req, res) => {
         created_by BIGINT UNSIGNED NULL,
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
       )`,
+
+      `CREATE TABLE IF NOT EXISTS promotions (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        promo_code VARCHAR(100) NOT NULL UNIQUE,
+        promo_name VARCHAR(180) NOT NULL,
+        platform ENUM('ALL', 'SHOPEE', 'TIKTOK', 'SALESMAN SO', 'OTHER') NOT NULL DEFAULT 'ALL',
+        start_date DATE NOT NULL,
+        end_date DATE NOT NULL,
+        package_price DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        remark VARCHAR(5000) NULL,
+        status ENUM('ACTIVE', 'INACTIVE') NOT NULL DEFAULT 'ACTIVE',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS promotion_items (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        promotion_id BIGINT UNSIGNED NOT NULL,
+        product_id BIGINT UNSIGNED NOT NULL,
+        qty DECIMAL(12,3) NOT NULL DEFAULT 1.000,
+        foc BOOLEAN NOT NULL DEFAULT FALSE,
+        remark VARCHAR(1000) NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_promotion_items_promo (promotion_id),
+        INDEX idx_promotion_items_product (product_id)
+      )`,
+      `CREATE TABLE IF NOT EXISTS announcements (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        title VARCHAR(180) NOT NULL,
+        message VARCHAR(5000) NOT NULL,
+        priority ENUM('NORMAL', 'IMPORTANT', 'URGENT') NOT NULL DEFAULT 'NORMAL',
+        start_date DATE NULL,
+        end_date DATE NULL,
+        status ENUM('ACTIVE', 'INACTIVE') NOT NULL DEFAULT 'ACTIVE',
+        created_by BIGINT UNSIGNED NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )`,
       `CREATE TABLE IF NOT EXISTS order_item_status_options (
         id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         name VARCHAR(80) NOT NULL UNIQUE,
@@ -192,6 +229,7 @@ app.get("/api/setup-db", async (req, res) => {
         order_date DATE NOT NULL DEFAULT (CURRENT_DATE),
         so_number VARCHAR(120) NULL UNIQUE,
         do_number VARCHAR(120) NULL,
+        promotion_id BIGINT UNSIGNED NULL,
         order_type ENUM('SALESMAN SO', 'SHOPEE', 'TIKTOK', 'OTHER') NOT NULL,
         tracking_number VARCHAR(180) NULL UNIQUE,
         customer_id BIGINT UNSIGNED NULL,
@@ -296,6 +334,13 @@ app.get("/api/setup-db", async (req, res) => {
       if (!String(e.message).includes("Duplicate column")) throw e;
     }
 
+
+
+    try {
+      await pool.execute("ALTER TABLE orders ADD COLUMN promotion_id BIGINT UNSIGNED NULL AFTER do_number");
+    } catch (e) {
+      if (!String(e.message).includes("Duplicate column")) throw e;
+    }
 
     const orderV2AlterStatements = [
       "ALTER TABLE orders ADD COLUMN order_date DATE NOT NULL DEFAULT (CURRENT_DATE) AFTER order_id",
@@ -496,6 +541,129 @@ app.put("/api/customers/:id", authRequired, requirePermission("orders:update"), 
 
 
 
+
+// PROMOTIONS
+app.get("/api/promotions", authRequired, requirePermission("orders:read"), async (req, res) => {
+  try {
+    const { status = "ACTIVE", active_today } = req.query;
+    const where = [];
+    const params = [];
+    if (status && status !== "ALL") { where.push("status=?"); params.push(status); }
+    if (active_today === "true") {
+      const today = dayjs().format("YYYY-MM-DD");
+      where.push("start_date <= ? AND end_date >= ?");
+      params.push(today, today);
+    }
+    const rows = await query(
+      `SELECT * FROM promotions ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY start_date DESC, created_at DESC`,
+      params
+    );
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/api/promotions", authRequired, requirePermission("orders:create"), async (req, res) => {
+  try {
+    const { promo_code, promo_name, platform = "ALL", start_date, end_date, package_price = 0, remark, status = "ACTIVE", items = [] } = req.body;
+    if (!promo_code || !promo_name || !start_date || !end_date) return res.status(400).json({ error: "promo_code, promo_name, start_date, end_date required" });
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [result] = await conn.execute(
+        "INSERT INTO promotions (promo_code, promo_name, platform, start_date, end_date, package_price, remark, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [promo_code, promo_name, platform, start_date, end_date, package_price, remark || null, status]
+      );
+      for (const item of items) {
+        await conn.execute("INSERT INTO promotion_items (promotion_id, product_id, qty, foc, remark) VALUES (?, ?, ?, ?, ?)", [result.insertId, item.product_id, item.qty || 1, item.foc ? 1 : 0, item.remark || null]);
+      }
+      await conn.commit();
+      res.json({ success: true, id: result.insertId });
+    } catch (e) { await conn.rollback(); throw e; } finally { conn.release(); }
+  } catch (err) {
+    if (err.code === "ER_DUP_ENTRY") return res.status(409).json({ error: "Promotion code already exists" });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/promotions/:id", authRequired, requirePermission("orders:read"), async (req, res) => {
+  try {
+    const rows = await query("SELECT * FROM promotions WHERE id=?", [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: "Promotion not found" });
+    const items = await query("SELECT pi.*, p.sku, p.name, p.image_url FROM promotion_items pi LEFT JOIN products p ON p.id=pi.product_id WHERE pi.promotion_id=?", [req.params.id]);
+    res.json({ ...rows[0], items });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put("/api/promotions/:id", authRequired, requirePermission("orders:update"), async (req, res) => {
+  try {
+    const { promo_code, promo_name, platform = "ALL", start_date, end_date, package_price = 0, remark, status = "ACTIVE" } = req.body;
+    await pool.execute(
+      "UPDATE promotions SET promo_code=?, promo_name=?, platform=?, start_date=?, end_date=?, package_price=?, remark=?, status=? WHERE id=?",
+      [promo_code, promo_name, platform, start_date, end_date, package_price, remark || null, status, req.params.id]
+    );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/api/promotions/:id/items", authRequired, requirePermission("orders:update"), async (req, res) => {
+  try {
+    const { product_id, qty = 1, foc = false, remark } = req.body;
+    const [result] = await pool.execute("INSERT INTO promotion_items (promotion_id, product_id, qty, foc, remark) VALUES (?, ?, ?, ?, ?)", [req.params.id, product_id, qty, foc ? 1 : 0, remark || null]);
+    res.json({ success: true, id: result.insertId });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete("/api/promotion-items/:id", authRequired, requirePermission("orders:update"), async (req, res) => {
+  try {
+    await pool.execute("DELETE FROM promotion_items WHERE id=?", [req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ANNOUNCEMENTS
+app.get("/api/announcements", authRequired, requirePermission("orders:read"), async (req, res) => {
+  try {
+    const { status = "ACTIVE", active_today } = req.query;
+    const where = [];
+    const params = [];
+    if (status && status !== "ALL") { where.push("status=?"); params.push(status); }
+    if (active_today === "true") {
+      const today = dayjs().format("YYYY-MM-DD");
+      where.push("(start_date IS NULL OR start_date <= ?) AND (end_date IS NULL OR end_date >= ?)");
+      params.push(today, today);
+    }
+    const rows = await query(
+      `SELECT * FROM announcements ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY FIELD(priority,'URGENT','IMPORTANT','NORMAL'), created_at DESC`,
+      params
+    );
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/api/announcements", authRequired, requirePermission("orders:create"), async (req, res) => {
+  try {
+    const { title, message, priority = "NORMAL", start_date, end_date, status = "ACTIVE" } = req.body;
+    if (!title || !message) return res.status(400).json({ error: "title and message required" });
+    const [result] = await pool.execute(
+      "INSERT INTO announcements (title, message, priority, start_date, end_date, status, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      [title, message, priority, start_date || null, end_date || null, status, req.user.id]
+    );
+    res.json({ success: true, id: result.insertId });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put("/api/announcements/:id", authRequired, requirePermission("orders:update"), async (req, res) => {
+  try {
+    const { title, message, priority = "NORMAL", start_date, end_date, status = "ACTIVE" } = req.body;
+    await pool.execute(
+      "UPDATE announcements SET title=?, message=?, priority=?, start_date=?, end_date=?, status=? WHERE id=?",
+      [title, message, priority, start_date || null, end_date || null, status, req.params.id]
+    );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
 // ORDER ITEM STATUS OPTIONS
 app.get("/api/order-item-status-options", authRequired, requirePermission("orders:read"), async (req, res) => {
   try {
@@ -520,7 +688,7 @@ app.post("/api/order-item-status-options", authRequired, requirePermission("orde
 // ORDERS
 app.post("/api/orders", authRequired, requirePermission("orders:create"), async (req,res) => {
   try {
-    const { order_id, order_date, so_number, do_number, order_type, tracking_number, customer_id, shop_name, customer_name, status="Pending", deadline_ship_date, warehouse_id, total=0, items=[] } = req.body;
+    const { order_id, order_date, so_number, do_number, promotion_id, order_type, tracking_number, customer_id, shop_name, customer_name, status="Pending", deadline_ship_date, warehouse_id, total=0, remark, items=[] } = req.body;
     if (!order_id || !order_type) return res.status(400).json({ error:"ORDER ID and order_type required" });
 
     const duplicateWhere = ["order_id = ?"];
@@ -549,8 +717,8 @@ app.post("/api/orders", authRequired, requirePermission("orders:create"), async 
     try {
       await conn.beginTransaction();
       const [result] = await conn.execute(
-        "INSERT INTO orders (order_id,order_date,so_number,do_number,order_type,tracking_number,customer_id,shop_name,customer_name,status,deadline_ship_date,warehouse_id,total,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        [order_id,order_date||dayjs().format("YYYY-MM-DD"),so_number||null,do_number||null,order_type,tracking_number||null,customer_id||null,shop_name||null,customer_name||null,status,deadline_ship_date||null,warehouse_id||null,total,req.user.id]
+        "INSERT INTO orders (order_id,order_date,so_number,do_number,promotion_id,order_type,tracking_number,customer_id,shop_name,customer_name,status,deadline_ship_date,warehouse_id,total,remark,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [order_id,order_date||dayjs().format("YYYY-MM-DD"),so_number||null,do_number||null,promotion_id||null,order_type,tracking_number||null,customer_id||null,shop_name||null,customer_name||null,status,deadline_ship_date||null,warehouse_id||null,total,remark||null,req.user.id]
       );
       for (const item of items) {
         await conn.execute("INSERT INTO order_items (order_id,product_id,qty,price,discount,foc,item_status,shipped_date,remark) VALUES (?,?,?,?,?,?,?,?,?)", [result.insertId,item.product_id,item.qty,item.price||0,item.discount||0,item.foc?1:0,item.item_status||"Pending",item.shipped_date||null,item.remark||null]);
@@ -589,10 +757,10 @@ app.get("/api/orders/:id", authRequired, requirePermission("orders:read"), async
 
 app.put("/api/orders/:id", authRequired, requirePermission("orders:update"), async (req, res) => {
   try {
-    const { order_date, so_number, do_number, tracking_number, customer_id, shop_name, customer_name, status, deadline_ship_date, total, remark } = req.body;
+    const { order_date, so_number, do_number, promotion_id, tracking_number, customer_id, shop_name, customer_name, status, deadline_ship_date, total, remark } = req.body;
     await pool.execute(
-      `UPDATE orders SET order_date=?, so_number=?, do_number=?, tracking_number=?, customer_id=?, shop_name=?, customer_name=?, status=?, deadline_ship_date=?, total=?, remark=? WHERE id=?`,
-      [order_date || null, so_number || null, do_number || null, tracking_number || null, customer_id || null, shop_name || null, customer_name || null, status || "Pending", deadline_ship_date || null, total || 0, remark || null, req.params.id]
+      `UPDATE orders SET order_date=?, so_number=?, do_number=?, promotion_id=?, tracking_number=?, customer_id=?, shop_name=?, customer_name=?, status=?, deadline_ship_date=?, total=?, remark=? WHERE id=?`,
+      [order_date || null, so_number || null, do_number || null, promotion_id || null, tracking_number || null, customer_id || null, shop_name || null, customer_name || null, status || "Pending", deadline_ship_date || null, total || 0, remark || null, req.params.id]
     );
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
