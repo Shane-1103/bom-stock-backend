@@ -182,6 +182,40 @@ app.get("/api/setup-db", async (req, res) => {
       )`,
 
 
+
+      `CREATE TABLE IF NOT EXISTS promotion_rules (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        promotion_id BIGINT UNSIGNED NOT NULL,
+        rule_type ENUM('BUY_X_FREE_Y') NOT NULL DEFAULT 'BUY_X_FREE_Y',
+        target_type ENUM('VEHICLE_MODEL','STICKER_CODE','CATEGORY','PRODUCT') NOT NULL DEFAULT 'VEHICLE_MODEL',
+        target_value VARCHAR(180) NOT NULL,
+        buy_qty DECIMAL(12,3) NOT NULL DEFAULT 0,
+        free_qty DECIMAL(12,3) NOT NULL DEFAULT 0,
+        free_product_id BIGINT UNSIGNED NULL,
+        status ENUM('ACTIVE','INACTIVE') NOT NULL DEFAULT 'ACTIVE',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS inventory_operations (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        operation_no VARCHAR(120) NOT NULL UNIQUE,
+        operation_type ENUM('IN','OUT','TRANSFER','ADJUSTMENT') NOT NULL,
+        from_warehouse_id BIGINT UNSIGNED NULL,
+        to_warehouse_id BIGINT UNSIGNED NULL,
+        operation_date DATE NOT NULL,
+        reference_no VARCHAR(120) NULL,
+        remark VARCHAR(5000) NULL,
+        created_by BIGINT UNSIGNED NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS inventory_operation_items (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        operation_id BIGINT UNSIGNED NOT NULL,
+        product_id BIGINT UNSIGNED NOT NULL,
+        qty DECIMAL(12,3) NOT NULL,
+        batch_no VARCHAR(120) NULL,
+        remark VARCHAR(1000) NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`,
       `CREATE TABLE IF NOT EXISTS vehicle_models (
         id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         name VARCHAR(120) NOT NULL UNIQUE,
@@ -600,6 +634,130 @@ app.put("/api/customers/:id", authRequired, requirePermission("orders:update"), 
 
 
 
+
+
+
+// ERP CORE PACKAGE
+
+// BOM
+app.get("/api/bom/:productId", authRequired, requirePermission("products:read"), async (req,res)=>{
+  try{
+    const productRows = await query("SELECT * FROM products WHERE id=?", [req.params.productId]);
+    if(!productRows.length) return res.status(404).json({error:"Product not found"});
+    const items = await query("SELECT bi.*, p.sku, p.name, p.cost, p.image_url, (bi.quantity * p.cost) AS total_cost FROM bom_items bi LEFT JOIN products p ON p.id=bi.component_product_id WHERE bi.product_id=?", [req.params.productId]);
+    const total = items.reduce((s,x)=>s+Number(x.total_cost||0),0);
+    res.json({...productRows[0], bom_items:items, bom_cost:total});
+  }catch(err){res.status(500).json({error:err.message})}
+});
+
+app.post("/api/bom/:productId/items", authRequired, requirePermission("products:update"), async (req,res)=>{
+  try{
+    const { component_product_id, quantity=1, unit="pcs" } = req.body;
+    if(!component_product_id) return res.status(400).json({error:"component_product_id required"});
+    const [r] = await pool.execute("INSERT INTO bom_items (product_id, component_product_id, quantity, unit) VALUES (?,?,?,?)", [req.params.productId, component_product_id, quantity, unit]);
+    res.json({success:true,id:r.insertId});
+  }catch(err){res.status(500).json({error:err.message})}
+});
+
+app.put("/api/bom-items/:id", authRequired, requirePermission("products:update"), async (req,res)=>{
+  try{
+    const { quantity=1, unit="pcs" } = req.body;
+    await pool.execute("UPDATE bom_items SET quantity=?, unit=? WHERE id=?", [quantity, unit, req.params.id]);
+    res.json({success:true});
+  }catch(err){res.status(500).json({error:err.message})}
+});
+
+app.delete("/api/bom-items/:id", authRequired, requirePermission("products:update"), async (req,res)=>{
+  try{ await pool.execute("DELETE FROM bom_items WHERE id=?", [req.params.id]); res.json({success:true});}
+  catch(err){res.status(500).json({error:err.message})}
+});
+
+// Promotion rules Buy X Free Y
+app.get("/api/promotions/:id/rules", authRequired, requirePermission("orders:read"), async (req,res)=>{
+  try{res.json(await query("SELECT pr.*, p.sku AS free_sku, p.name AS free_product_name FROM promotion_rules pr LEFT JOIN products p ON p.id=pr.free_product_id WHERE promotion_id=? ORDER BY id DESC",[req.params.id]));}
+  catch(err){res.status(500).json({error:err.message})}
+});
+
+app.post("/api/promotions/:id/rules", authRequired, requirePermission("orders:update"), async (req,res)=>{
+  try{
+    const {target_type="VEHICLE_MODEL",target_value,buy_qty,free_qty,free_product_id,status="ACTIVE"}=req.body;
+    if(!target_value) return res.status(400).json({error:"target_value required"});
+    const [r]=await pool.execute("INSERT INTO promotion_rules (promotion_id,target_type,target_value,buy_qty,free_qty,free_product_id,status) VALUES (?,?,?,?,?,?,?)",[req.params.id,target_type,target_value,buy_qty||0,free_qty||0,free_product_id||null,status]);
+    res.json({success:true,id:r.insertId});
+  }catch(err){res.status(500).json({error:err.message})}
+});
+
+app.post("/api/promotions/calculate", authRequired, requirePermission("orders:read"), async (req,res)=>{
+  try{
+    const { promotion_id, items=[] } = req.body;
+    const rules = await query("SELECT * FROM promotion_rules WHERE promotion_id=? AND status='ACTIVE'", [promotion_id]);
+    const products = items.length ? await query(`SELECT * FROM products WHERE id IN (${items.map(()=>"?").join(",")})`, items.map(i=>i.product_id)) : [];
+    const productMap = Object.fromEntries(products.map(p=>[p.id,p]));
+    const results = [];
+    for(const rule of rules){
+      let qty = 0;
+      for(const item of items){
+        const p = productMap[item.product_id];
+        if(!p) continue;
+        if(rule.target_type==="VEHICLE_MODEL" && p.vehicle_model===rule.target_value) qty += Number(item.qty||0);
+        if(rule.target_type==="STICKER_CODE" && p.sticker_code===rule.target_value) qty += Number(item.qty||0);
+        if(rule.target_type==="CATEGORY" && p.category===rule.target_value) qty += Number(item.qty||0);
+        if(rule.target_type==="PRODUCT" && String(p.id)===String(rule.target_value)) qty += Number(item.qty||0);
+      }
+      const free = Math.floor(qty / Number(rule.buy_qty||1)) * Number(rule.free_qty||0);
+      results.push({rule, matched_qty:qty, free_qty:free});
+    }
+    res.json({ok:true, results});
+  }catch(err){res.status(500).json({error:err.message})}
+});
+
+// Inventory operations
+app.get("/api/inventory-operations", authRequired, requirePermission("inventory:read"), async (req,res)=>{
+  try{res.json(await query("SELECT io.*, fw.name AS from_warehouse, tw.name AS to_warehouse FROM inventory_operations io LEFT JOIN warehouses fw ON fw.id=io.from_warehouse_id LEFT JOIN warehouses tw ON tw.id=io.to_warehouse_id ORDER BY io.created_at DESC LIMIT 200"));}
+  catch(err){res.status(500).json({error:err.message})}
+});
+
+app.post("/api/inventory-operations", authRequired, requirePermission("inventory:update"), async (req,res)=>{
+  const conn = await pool.getConnection();
+  try{
+    const {operation_no, operation_type, from_warehouse_id, to_warehouse_id, operation_date, reference_no, remark, items=[]}=req.body;
+    if(!operation_no || !operation_type || !operation_date) return res.status(400).json({error:"operation_no, operation_type, operation_date required"});
+    await conn.beginTransaction();
+    const [r]=await conn.execute("INSERT INTO inventory_operations (operation_no,operation_type,from_warehouse_id,to_warehouse_id,operation_date,reference_no,remark,created_by) VALUES (?,?,?,?,?,?,?,?)",[operation_no,operation_type,from_warehouse_id||null,to_warehouse_id||null,operation_date,reference_no||null,remark||null,req.user.id]);
+    for(const item of items){
+      await conn.execute("INSERT INTO inventory_operation_items (operation_id,product_id,qty,batch_no,remark) VALUES (?,?,?,?,?)",[r.insertId,item.product_id,item.qty,item.batch_no||null,item.remark||null]);
+      if(operation_type==="IN" || operation_type==="ADJUSTMENT"){
+        await conn.execute("INSERT INTO inventory (product_id,warehouse_id,qty_on_hand,qty_reserved) VALUES (?,?,?,0) ON DUPLICATE KEY UPDATE qty_on_hand=qty_on_hand+VALUES(qty_on_hand)",[item.product_id,to_warehouse_id,item.qty]);
+      }
+      if(operation_type==="OUT"){
+        await conn.execute("UPDATE inventory SET qty_on_hand=qty_on_hand-? WHERE product_id=? AND warehouse_id=?",[item.qty,item.product_id,from_warehouse_id]);
+      }
+      if(operation_type==="TRANSFER"){
+        await conn.execute("UPDATE inventory SET qty_on_hand=qty_on_hand-? WHERE product_id=? AND warehouse_id=?",[item.qty,item.product_id,from_warehouse_id]);
+        await conn.execute("INSERT INTO inventory (product_id,warehouse_id,qty_on_hand,qty_reserved) VALUES (?,?,?,0) ON DUPLICATE KEY UPDATE qty_on_hand=qty_on_hand+VALUES(qty_on_hand)",[item.product_id,to_warehouse_id,item.qty]);
+      }
+    }
+    await conn.commit(); res.json({success:true,id:r.insertId});
+  }catch(err){await conn.rollback(); res.status(500).json({error:err.message});}
+  finally{conn.release();}
+});
+
+// Order item evidence upload
+app.post("/api/order-items/:id/evidence", authRequired, requirePermission("orders:update"), upload.single("file"), async (req,res)=>{
+  try{
+    if(!req.file) return res.status(400).json({error:"file required"});
+    const mime = req.file.mimetype || "";
+    const media_type = mime.startsWith("video") ? "video" : "photo";
+    const file_url = "/uploads/" + req.file.filename;
+    const [r] = await pool.execute("INSERT INTO order_item_media (order_item_id, media_type, file_url, file_name, file_size, mime_type, uploaded_by) VALUES (?,?,?,?,?,?,?)",[req.params.id,media_type,file_url,req.file.originalname,req.file.size,mime,req.user.id]);
+    res.json({success:true,id:r.insertId,file_url,media_type});
+  }catch(err){res.status(500).json({error:err.message})}
+});
+
+app.get("/api/order-items/:id/evidence", authRequired, requirePermission("orders:read"), async (req,res)=>{
+  try{res.json(await query("SELECT * FROM order_item_media WHERE order_item_id=? ORDER BY uploaded_at DESC",[req.params.id]));}
+  catch(err){res.status(500).json({error:err.message})}
+});
 
 
 // PRODUCT VARIANT OPTIONS
