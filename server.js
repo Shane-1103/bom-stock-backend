@@ -179,10 +179,10 @@ app.get("/api/setup-db", async (req, res) => {
         id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         order_id VARCHAR(120) NOT NULL UNIQUE,
         order_date DATE NOT NULL DEFAULT (CURRENT_DATE),
-        so_number VARCHAR(120) NULL,
+        so_number VARCHAR(120) NULL UNIQUE,
         do_number VARCHAR(120) NULL,
         order_type ENUM('SALESMAN SO', 'SHOPEE', 'TIKTOK', 'OTHER') NOT NULL,
-        tracking_number VARCHAR(180) NULL,
+        tracking_number VARCHAR(180) NULL UNIQUE,
         customer_id BIGINT UNSIGNED NULL,
         shop_name VARCHAR(180) NULL,
         customer_name VARCHAR(180) NULL,
@@ -314,6 +314,22 @@ app.get("/api/setup-db", async (req, res) => {
       ('Completed', 6, TRUE),
       ('Cancelled', 7, FALSE)`);
 
+
+    const uniqueIndexStatements = [
+      "CREATE UNIQUE INDEX unique_order_so_number ON orders (so_number)",
+      "CREATE UNIQUE INDEX unique_order_tracking_number ON orders (tracking_number)"
+    ];
+    for (const sql of uniqueIndexStatements) {
+      try {
+        await pool.execute(sql);
+      } catch (e) {
+        const msg = String(e.message || "");
+        if (!msg.includes("Duplicate key name") && !msg.includes("Duplicate entry")) {
+          console.log("Index setup skipped:", msg);
+        }
+      }
+    }
+
     await pool.execute(`INSERT IGNORE INTO warehouses (name, code, address) VALUES
       ('Main Warehouse', 'MAIN', 'Main stock location'),
       ('Johor Warehouse', 'JHR', 'Johor branch warehouse'),
@@ -380,7 +396,7 @@ app.get("/api/customers", authRequired, requirePermission("orders:read"), async 
       where.push("platform = ?");
       params.push(platform);
     }
-    if (status) {
+    if (status && status !== "ALL") {
       where.push("status = ?");
       params.push(status);
     }
@@ -451,6 +467,29 @@ app.post("/api/orders", authRequired, requirePermission("orders:create"), async 
   try {
     const { order_id, order_date, so_number, do_number, order_type, tracking_number, customer_id, shop_name, customer_name, status="Pending", deadline_ship_date, warehouse_id, total=0, items=[] } = req.body;
     if (!order_id || !order_type) return res.status(400).json({ error:"ORDER ID and order_type required" });
+
+    const duplicateWhere = ["order_id = ?"];
+    const duplicateParams = [order_id];
+    if (so_number) {
+      duplicateWhere.push("so_number = ?");
+      duplicateParams.push(so_number);
+    }
+    if (tracking_number) {
+      duplicateWhere.push("tracking_number = ?");
+      duplicateParams.push(tracking_number);
+    }
+    const duplicates = await query(
+      `SELECT order_id, so_number, tracking_number FROM orders WHERE ${duplicateWhere.join(" OR ")} LIMIT 1`,
+      duplicateParams
+    );
+    if (duplicates.length) {
+      const d = duplicates[0];
+      if (d.order_id === order_id) return res.status(409).json({ error: "ORDER ID already exists" });
+      if (so_number && d.so_number === so_number) return res.status(409).json({ error: "SO NUMBER already exists" });
+      if (tracking_number && d.tracking_number === tracking_number) return res.status(409).json({ error: "TRACKING NUMBER already exists" });
+      return res.status(409).json({ error: "Duplicate order value exists" });
+    }
+
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
@@ -464,7 +503,10 @@ app.post("/api/orders", authRequired, requirePermission("orders:create"), async 
       await conn.commit();
       res.json({ success:true, id:result.insertId });
     } catch(e) { await conn.rollback(); throw e; } finally { conn.release(); }
-  } catch(err) { res.status(500).json({ error:err.message }); }
+  } catch(err) {
+    if (err.code === "ER_DUP_ENTRY") return res.status(409).json({ error: "ORDER ID / SO NUMBER / TRACKING NUMBER already exists" });
+    res.status(500).json({ error:err.message });
+  }
 });
 
 app.get("/api/orders", authRequired, requirePermission("orders:read"), async (req,res) => {
@@ -569,6 +611,39 @@ app.post("/api/orders/:orderId/items/:orderItemId/media", authRequired, requireP
     res.json({ success:true, files:saved });
   } catch(err){ res.status(500).json({ error:err.message });}
 });
+
+
+// ORDER CSV IMPORT / EXPORT
+function csvEscape(value) {
+  const s = String(value ?? "");
+  return `"${s.replace(/"/g, '""')}"`;
+}
+
+app.get("/api/orders-template.csv", authRequired, requirePermission("orders:read"), async (req, res) => {
+  const headers = [
+    "order_id","order_date","so_number","do_number","order_type","tracking_number",
+    "customer_name","shop_name","deadline_ship_date","total"
+  ];
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", "attachment; filename=orders-import-template.csv");
+  res.send(headers.join(",") + "\\n");
+});
+
+app.get("/api/orders-export.csv", authRequired, requirePermission("orders:read"), async (req, res) => {
+  try {
+    const rows = await query(`SELECT order_id, order_date, so_number, do_number, order_type, tracking_number, customer_name, shop_name, status, deadline_ship_date, total, created_at FROM orders ORDER BY created_at DESC`);
+    const headers = ["order_id","order_date","so_number","do_number","order_type","tracking_number","customer_name","shop_name","status","deadline_ship_date","total","created_at"];
+    const csv = [headers.join(",")]
+      .concat(rows.map(r => headers.map(h => csvEscape(r[h])).join(",")))
+      .join("\\n");
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", "attachment; filename=orders-export.csv");
+    res.send(csv);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 // REPORTS
 app.get("/api/reports/shipments", authRequired, requirePermission("reports:read"), async (req,res) => {
