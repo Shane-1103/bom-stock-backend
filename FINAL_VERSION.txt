@@ -1,0 +1,20 @@
+BOM Stock ERP - Final Test Backend
+Version: FINAL-TEST-1
+
+Includes:
+- Login/Register/Role
+- Customers + Sales Agent
+- Product Variant System
+- Orders + SO/DO/Tracking/Remark/Item Status/FOC
+- Order item evidence upload
+- BOM Management API
+- Inventory Operations
+- Promotion Engine API
+- Announcements
+- Reports base
+- Auto DB setup endpoint: /api/setup-db
+
+Deploy:
+1. Upload all files to GitHub backend repository.
+2. Render -> Manual Deploy -> Deploy latest commit.
+3. Open /api/setup-db after deploy.
