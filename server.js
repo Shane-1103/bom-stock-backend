@@ -14,6 +14,18 @@ const app = express();
 
 const uploadDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+const commercialStorage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadDir),
+  filename: (req, file, cb) => {
+    const safe = String(file.originalname || "file").replace(/[^a-zA-Z0-9._-]/g, "_");
+    cb(null, Date.now() + "-" + Math.round(Math.random() * 1e9) + "-" + safe);
+  },
+});
+const commercialUpload = multer({ storage: commercialStorage });
+
+
+const uploadDir = path.join(__dirname, "uploads");
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadDir),
   filename: (req, file, cb) => {
@@ -28,6 +40,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "change-this-secret-key";
 
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
+app.use("/uploads", express.static(uploadDir));
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 const pool = mysql.createPool({
@@ -513,6 +526,7 @@ app.get("/api/setup-db", async (req, res) => {
     await pool.execute(`INSERT IGNORE INTO inventory (product_id, warehouse_id, qty_on_hand, qty_reserved)
       SELECT p.id, w.id, 0, 0 FROM products p CROSS JOIN warehouses w`);
 
+    await ensureCommercialV1Schema();
     const tables = await query("SHOW TABLES");
     res.json({ ok: true, message: "Database setup completed", tables });
   } catch (err) {
@@ -1276,5 +1290,443 @@ app.post("/api/chat/rooms/:roomId/messages", authRequired, requirePermission("ch
   try{ const [r]=await pool.execute("INSERT INTO chat_messages (room_id,sender_id,message) VALUES (?,?,?)",[req.params.roomId,req.user.id,req.body.message]); res.json({success:true,id:r.insertId});}
   catch(err){res.status(500).json({error:err.message});}
 });
+
+
+// ===================== COMMERCIAL UPDATE PACKAGE V1 CORE =====================
+async function ensureColumnV1(tableName, columnName, definitionSql) {
+  try { await pool.execute(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definitionSql}`); }
+  catch (err) { if (!String(err.message || "").includes("Duplicate column")) throw err; }
+}
+
+async function ensureCommercialV1Schema() {
+  const statements = [
+    `CREATE TABLE IF NOT EXISTS product_variants (
+      id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      type ENUM('VEHICLE_MODEL','STICKER_CODE','COVER_COLOR','CATEGORY') NOT NULL,
+      code VARCHAR(120) NOT NULL,
+      name VARCHAR(180) NOT NULL,
+      status ENUM('ACTIVE','INACTIVE') NOT NULL DEFAULT 'ACTIVE',
+      remark TEXT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY unique_variant_type_code (type, code)
+    )`,
+    `CREATE TABLE IF NOT EXISTS couriers (
+      id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(180) NOT NULL UNIQUE,
+      status ENUM('ACTIVE','INACTIVE') NOT NULL DEFAULT 'ACTIVE',
+      remark TEXT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS employee_roles (
+      id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      role_name VARCHAR(120) NOT NULL UNIQUE,
+      status ENUM('ACTIVE','INACTIVE') NOT NULL DEFAULT 'ACTIVE',
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS employees (
+      id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(180) NOT NULL,
+      role_id BIGINT UNSIGNED NULL,
+      status ENUM('ACTIVE','INACTIVE') NOT NULL DEFAULT 'ACTIVE',
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS order_assignments (
+      id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      order_id BIGINT UNSIGNED NOT NULL,
+      employee_id BIGINT UNSIGNED NOT NULL,
+      role_id BIGINT UNSIGNED NULL,
+      task_status ENUM('Pending','In Progress','Done','Hold','Cancelled') NOT NULL DEFAULT 'Pending',
+      remark VARCHAR(5000) NULL,
+      assigned_by BIGINT UNSIGNED NULL,
+      assigned_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      completed_at TIMESTAMP NULL,
+      INDEX idx_order_assignments_order (order_id),
+      INDEX idx_order_assignments_employee (employee_id)
+    )`,
+    `CREATE TABLE IF NOT EXISTS assignment_rules (
+      id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      condition_type ENUM('VEHICLE_MODEL','PLATFORM','CUSTOMER','CATEGORY','STICKER_CODE') NOT NULL,
+      condition_value VARCHAR(180) NOT NULL,
+      role_id BIGINT UNSIGNED NOT NULL,
+      employee_id BIGINT UNSIGNED NOT NULL,
+      status ENUM('ACTIVE','INACTIVE') NOT NULL DEFAULT 'ACTIVE',
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS shipments_v1 (
+      id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      shipment_no VARCHAR(120) NOT NULL UNIQUE,
+      courier_id BIGINT UNSIGNED NULL,
+      courier_tracking_number VARCHAR(180) NULL,
+      platform_tracking_number VARCHAR(180) NULL,
+      shipment_date DATE NOT NULL,
+      load_status ENUM('Packed','Ready To Load','Loaded','Picked Up','Completed','Hold') NOT NULL DEFAULT 'Ready To Load',
+      remark VARCHAR(5000) NULL,
+      created_by BIGINT UNSIGNED NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS order_item_shipments (
+      id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      order_item_id BIGINT UNSIGNED NOT NULL,
+      shipment_id BIGINT UNSIGNED NOT NULL,
+      ship_qty DECIMAL(12,3) NOT NULL,
+      warehouse_id BIGINT UNSIGNED NOT NULL,
+      status ENUM('Packed','Ready To Load','Loaded','Picked Up','Completed','Hold') NOT NULL DEFAULT 'Ready To Load',
+      created_by BIGINT UNSIGNED NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_item_shipments_item (order_item_id),
+      INDEX idx_item_shipments_shipment (shipment_id)
+    )`,
+    `CREATE TABLE IF NOT EXISTS loading_logs (
+      id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      shipment_id BIGINT UNSIGNED NOT NULL,
+      order_item_shipment_id BIGINT UNSIGNED NULL,
+      load_status ENUM('Packed','Ready To Load','Loaded','Picked Up','Completed','Hold') NOT NULL,
+      loaded_by BIGINT UNSIGNED NULL,
+      loaded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      remark VARCHAR(1000) NULL
+    )`
+  ];
+  for (const sql of statements) await pool.execute(sql);
+
+  await ensureColumnV1("products", "vehicle_model", "VARCHAR(120) NULL");
+  await ensureColumnV1("products", "sticker_code", "VARCHAR(120) NULL");
+  await ensureColumnV1("products", "cover_color", "VARCHAR(120) NULL");
+  await ensureColumnV1("products", "remark", "VARCHAR(5000) NULL");
+  await ensureColumnV1("orders", "order_date", "DATE NULL");
+  await ensureColumnV1("orders", "so_number", "VARCHAR(120) NULL");
+  await ensureColumnV1("orders", "do_number", "VARCHAR(120) NULL");
+  await ensureColumnV1("orders", "sales_agent_id", "BIGINT UNSIGNED NULL");
+  await ensureColumnV1("order_items", "ordered_qty", "DECIMAL(12,3) NULL");
+  await ensureColumnV1("order_items", "shipped_qty", "DECIMAL(12,3) NOT NULL DEFAULT 0");
+  await ensureColumnV1("order_items", "balance_qty", "DECIMAL(12,3) NULL");
+  await ensureColumnV1("order_items", "foc", "BOOLEAN NOT NULL DEFAULT FALSE");
+  await ensureColumnV1("order_items", "item_status", "VARCHAR(80) NOT NULL DEFAULT 'Pending'");
+  await ensureColumnV1("order_items", "shipped_date", "DATE NULL");
+  await ensureColumnV1("warehouses", "remark", "VARCHAR(5000) NULL");
+
+  try { await pool.execute("CREATE UNIQUE INDEX unique_orders_so_number ON orders (so_number)"); } catch (e) {}
+  try { await pool.execute("CREATE UNIQUE INDEX unique_orders_tracking_number ON orders (tracking_number)"); } catch (e) {}
+
+  await pool.execute(`INSERT IGNORE INTO product_variants (type, code, name) VALUES
+    ('VEHICLE_MODEL','Y15ZR','Y15ZR'),('VEHICLE_MODEL','LC135','LC135'),('VEHICLE_MODEL','RS150','RS150'),
+    ('STICKER_CODE','RX01','RX01'),('STICKER_CODE','RX02','RX02'),
+    ('COVER_COLOR','BLACK','Black'),('COVER_COLOR','RED','Red'),('COVER_COLOR','BLUE','Blue'),
+    ('CATEGORY','COVER_SET','Cover Set'),('CATEGORY','STICKER','Sticker')`);
+  await pool.execute(`INSERT IGNORE INTO couriers (name) VALUES ('J&T'),('Shopee Express'),('TikTok Logistics'),('Flash'),('DHL'),('PosLaju')`);
+  await pool.execute(`INSERT IGNORE INTO employee_roles (role_name) VALUES ('Marker'),('Packer'),('Checker'),('Shipment'),('Customer Service'),('Production'),('Designer'),('Admin')`);
+}
+
+app.get("/api/setup-db-v1", async (req, res) => {
+  try {
+    await ensureCommercialV1Schema();
+    const tables = await query("SHOW TABLES");
+    res.json({ ok: true, message: "Commercial V1 schema setup completed", tables });
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
+});
+
+// Product Master Pro
+app.put("/api/v1/products/:id", authRequired, requirePermission("products:update"), async (req, res) => {
+  try {
+    const { sku, name, category, vehicle_model, sticker_code, cover_color, price = 0, cost = 0, image_url, status = "ACTIVE", remark } = req.body;
+    await pool.execute(
+      `UPDATE products SET sku=?, name=?, category=?, vehicle_model=?, sticker_code=?, cover_color=?, price=?, cost=?, image_url=?, status=?, remark=? WHERE id=?`,
+      [sku, name, category || null, vehicle_model || null, sticker_code || null, cover_color || null, price, cost, image_url || null, status, remark || null, req.params.id]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    if (err.code === "ER_DUP_ENTRY") return res.status(409).json({ error: "Item Code already exists" });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/v1/products-search", authRequired, requirePermission("products:read"), async (req, res) => {
+  try {
+    const { q, status = "ACTIVE" } = req.query;
+    const where = [];
+    const params = [];
+    if (status && status !== "ALL") { where.push("status=?"); params.push(status); }
+    if (q) {
+      where.push("(sku LIKE ? OR name LIKE ? OR vehicle_model LIKE ? OR sticker_code LIKE ? OR cover_color LIKE ? OR category LIKE ?)");
+      params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+    }
+    const rows = await query(`SELECT * FROM products ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY sku ASC LIMIT 500`, params);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Variant Pro
+app.get("/api/v1/variants", authRequired, requirePermission("products:read"), async (req, res) => {
+  try {
+    const { type, q, status = "ALL" } = req.query;
+    const where = [];
+    const params = [];
+    if (type && type !== "ALL") { where.push("type=?"); params.push(type); }
+    if (status && status !== "ALL") { where.push("status=?"); params.push(status); }
+    if (q) { where.push("(code LIKE ? OR name LIKE ?)"); params.push(`%${q}%`, `%${q}%`); }
+    res.json(await query(`SELECT * FROM product_variants ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY type, code LIMIT 1000`, params));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/api/v1/variants", authRequired, requirePermission("products:create"), async (req, res) => {
+  try {
+    const { type, code, name, status = "ACTIVE", remark } = req.body;
+    const [r] = await pool.execute("INSERT INTO product_variants (type, code, name, status, remark) VALUES (?, ?, ?, ?, ?)", [type, code, name || code, status, remark || null]);
+    res.json({ success: true, id: r.insertId });
+  } catch (err) {
+    if (err.code === "ER_DUP_ENTRY") return res.status(409).json({ error: "Variant already exists" });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/v1/variants/:id", authRequired, requirePermission("products:update"), async (req, res) => {
+  try {
+    const { type, code, name, status = "ACTIVE", remark } = req.body;
+    await pool.execute("UPDATE product_variants SET type=?, code=?, name=?, status=?, remark=? WHERE id=?", [type, code, name || code, status, remark || null, req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete("/api/v1/variants/:id", authRequired, requirePermission("products:update"), async (req, res) => {
+  try {
+    const rows = await query("SELECT * FROM product_variants WHERE id=? LIMIT 1", [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: "Variant not found" });
+    const v = rows[0];
+    const field = v.type === "VEHICLE_MODEL" ? "vehicle_model" : v.type === "STICKER_CODE" ? "sticker_code" : v.type === "COVER_COLOR" ? "cover_color" : "category";
+    const used = await query(`SELECT id FROM products WHERE ${field}=? LIMIT 1`, [v.code]);
+    if (used.length) return res.status(409).json({ error: "Variant is used by products. Set it inactive instead." });
+    await pool.execute("DELETE FROM product_variants WHERE id=?", [req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Warehouse Center
+app.post("/api/v1/warehouses", authRequired, requirePermission("inventory:update"), async (req, res) => {
+  try {
+    const { code, name, address, status = "ACTIVE", remark } = req.body;
+    const [r] = await pool.execute("INSERT INTO warehouses (code, name, address, status, remark) VALUES (?, ?, ?, ?, ?)", [code, name, address || null, status, remark || null]);
+    res.json({ success: true, id: r.insertId });
+  } catch (err) {
+    if (err.code === "ER_DUP_ENTRY") return res.status(409).json({ error: "Warehouse code already exists" });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/v1/warehouses/:id", authRequired, requirePermission("inventory:update"), async (req, res) => {
+  try {
+    const { code, name, address, status = "ACTIVE", remark } = req.body;
+    await pool.execute("UPDATE warehouses SET code=?, name=?, address=?, status=?, remark=? WHERE id=?", [code, name, address || null, status, remark || null, req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Assignment Center
+app.get("/api/v1/employee-roles", authRequired, requirePermission("orders:read"), async (req, res) => {
+  try { res.json(await query("SELECT * FROM employee_roles ORDER BY role_name ASC")); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/api/v1/employee-roles", authRequired, requirePermission("orders:create"), async (req, res) => {
+  try {
+    const [r] = await pool.execute("INSERT INTO employee_roles (role_name, status) VALUES (?, ?)", [req.body.role_name, req.body.status || "ACTIVE"]);
+    res.json({ success: true, id: r.insertId });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get("/api/v1/employees", authRequired, requirePermission("orders:read"), async (req, res) => {
+  try { res.json(await query("SELECT e.*, r.role_name FROM employees e LEFT JOIN employee_roles r ON r.id=e.role_id ORDER BY e.name ASC")); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/api/v1/employees", authRequired, requirePermission("orders:create"), async (req, res) => {
+  try {
+    const { name, role_id, status = "ACTIVE" } = req.body;
+    const [r] = await pool.execute("INSERT INTO employees (name, role_id, status) VALUES (?, ?, ?)", [name, role_id || null, status]);
+    res.json({ success: true, id: r.insertId });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put("/api/v1/employees/:id", authRequired, requirePermission("orders:update"), async (req, res) => {
+  try {
+    const { name, role_id, status = "ACTIVE" } = req.body;
+    await pool.execute("UPDATE employees SET name=?, role_id=?, status=? WHERE id=?", [name, role_id || null, status, req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get("/api/v1/assignments", authRequired, requirePermission("orders:read"), async (req, res) => {
+  try {
+    res.json(await query(`SELECT a.*, o.order_id, o.so_number, e.name employee_name, r.role_name
+      FROM order_assignments a
+      LEFT JOIN orders o ON o.id=a.order_id
+      LEFT JOIN employees e ON e.id=a.employee_id
+      LEFT JOIN employee_roles r ON r.id=a.role_id
+      ORDER BY a.assigned_at DESC LIMIT 500`));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/api/v1/assignments", authRequired, requirePermission("orders:update"), async (req, res) => {
+  try {
+    const { order_id, employee_id, role_id, task_status = "Pending", remark } = req.body;
+    const [r] = await pool.execute("INSERT INTO order_assignments (order_id, employee_id, role_id, task_status, remark, assigned_by) VALUES (?, ?, ?, ?, ?, ?)", [order_id, employee_id, role_id || null, task_status, remark || null, req.user.id]);
+    res.json({ success: true, id: r.insertId });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Shipment Center + stock deduction
+app.post("/api/v1/order-items/:id/ship", authRequired, requirePermission("orders:ship"), async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const { ship_qty, warehouse_id, courier_id, courier_tracking_number, platform_tracking_number, shipment_no, shipment_date, remark } = req.body;
+    if (!ship_qty || !warehouse_id) return res.status(400).json({ error: "ship_qty and warehouse_id required" });
+    await conn.beginTransaction();
+
+    const [items] = await conn.execute("SELECT oi.*, p.sku, p.name FROM order_items oi LEFT JOIN products p ON p.id=oi.product_id WHERE oi.id=?", [req.params.id]);
+    if (!items.length) throw new Error("Order item not found");
+    const item = items[0];
+    const orderedQty = Number(item.ordered_qty || item.qty || 0);
+    const shippedQty = Number(item.shipped_qty || 0);
+    const balanceQty = orderedQty - shippedQty;
+    if (Number(ship_qty) > balanceQty) throw new Error("Ship qty exceeds balance qty");
+
+    const [invRows] = await conn.execute("SELECT qty_available, qty_on_hand FROM inventory WHERE product_id=? AND warehouse_id=? LIMIT 1", [item.product_id, warehouse_id]);
+    const available = Number(invRows[0]?.qty_available ?? invRows[0]?.qty_on_hand ?? 0);
+    if (Number(ship_qty) > available) throw new Error("Insufficient stock");
+
+    const shipNo = shipment_no || ("SHP-" + Date.now());
+    const [shipResult] = await conn.execute(
+      "INSERT INTO shipments_v1 (shipment_no, courier_id, courier_tracking_number, platform_tracking_number, shipment_date, load_status, remark, created_by) VALUES (?, ?, ?, ?, ?, 'Ready To Load', ?, ?)",
+      [shipNo, courier_id || null, courier_tracking_number || null, platform_tracking_number || null, shipment_date || new Date(), remark || null, req.user.id]
+    );
+
+    const [itemShipResult] = await conn.execute(
+      "INSERT INTO order_item_shipments (order_item_id, shipment_id, ship_qty, warehouse_id, status, created_by) VALUES (?, ?, ?, ?, 'Ready To Load', ?)",
+      [req.params.id, shipResult.insertId, ship_qty, warehouse_id, req.user.id]
+    );
+
+    await conn.execute("UPDATE inventory SET qty_on_hand=qty_on_hand-? WHERE product_id=? AND warehouse_id=?", [ship_qty, item.product_id, warehouse_id]);
+    const newShipped = shippedQty + Number(ship_qty);
+    const newBalance = orderedQty - newShipped;
+    const newStatus = newBalance <= 0 ? "Shipped" : "Partial Shipped";
+    await conn.execute("UPDATE order_items SET ordered_qty=?, shipped_qty=?, balance_qty=?, item_status=?, shipped_date=IF(?='Shipped', CURRENT_DATE, shipped_date) WHERE id=?", [orderedQty, newShipped, newBalance, newStatus, newStatus, req.params.id]);
+    await conn.execute("INSERT INTO stock_movements (product_id, from_warehouse_id, qty, type, reference_no, remark, created_by) VALUES (?, ?, ?, 'OUT', ?, ?, ?)", [item.product_id, warehouse_id, ship_qty, shipNo, "Order item shipment", req.user.id]);
+    await conn.execute("INSERT INTO loading_logs (shipment_id, order_item_shipment_id, load_status, loaded_by, remark) VALUES (?, ?, 'Ready To Load', ?, ?)", [shipResult.insertId, itemShipResult.insertId, req.user.id, "Created shipment"]);
+
+    await conn.commit();
+    res.json({ success: true, shipment_id: shipResult.insertId, order_item_shipment_id: itemShipResult.insertId, shipped_qty: newShipped, balance_qty: newBalance, status: newStatus });
+  } catch (err) {
+    await conn.rollback();
+    res.status(500).json({ error: err.message });
+  } finally { conn.release(); }
+});
+
+app.get("/api/v1/shipments", authRequired, requirePermission("orders:read"), async (req, res) => {
+  try {
+    const { status } = req.query;
+    const where = status ? "WHERE s.load_status=?" : "";
+    const params = status ? [status] : [];
+    res.json(await query(`SELECT s.*, c.name courier_name FROM shipments_v1 s LEFT JOIN couriers c ON c.id=s.courier_id ${where} ORDER BY s.created_at DESC LIMIT 500`, params));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put("/api/v1/shipments/:id/load-status", authRequired, requirePermission("orders:ship"), async (req, res) => {
+  try {
+    const { load_status, remark } = req.body;
+    await pool.execute("UPDATE shipments_v1 SET load_status=? WHERE id=?", [load_status, req.params.id]);
+    await pool.execute("UPDATE order_item_shipments SET status=? WHERE shipment_id=?", [load_status, req.params.id]);
+    await pool.execute("INSERT INTO loading_logs (shipment_id, load_status, loaded_by, remark) VALUES (?, ?, ?, ?)", [req.params.id, load_status, req.user.id, remark || null]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get("/api/v1/couriers", authRequired, requirePermission("orders:read"), async (req, res) => {
+  try { res.json(await query("SELECT * FROM couriers ORDER BY name ASC")); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Pending Summary Pro
+app.get("/api/v1/reports/pending-summary", authRequired, requirePermission("reports:read"), async (req, res) => {
+  try {
+    const { date_from, date_to, platform, stock_status } = req.query;
+    const where = ["o.status NOT IN ('Shipped','Completed','Cancelled')"];
+    const params = [];
+    if (date_from) { where.push("DATE(o.created_at) >= ?"); params.push(date_from); }
+    if (date_to) { where.push("DATE(o.created_at) <= ?"); params.push(date_to); }
+    if (platform && platform !== "ALL") { where.push("o.order_type=?"); params.push(platform); }
+    const rows = await query(`
+      SELECT o.id order_pk, o.order_id, o.so_number, o.order_type, o.shop_name, o.status order_status,
+        oi.id order_item_id, oi.product_id, p.sku item_code, p.name product_name,
+        p.vehicle_model, p.sticker_code, p.cover_color, p.category,
+        COALESCE(oi.ordered_qty, oi.qty, 0) ordered_qty,
+        COALESCE(oi.shipped_qty, 0) shipped_qty,
+        (COALESCE(oi.ordered_qty, oi.qty, 0) - COALESCE(oi.shipped_qty, 0)) balance_qty,
+        COALESCE(SUM(i.qty_available), SUM(i.qty_on_hand), 0) available_stock
+      FROM orders o
+      JOIN order_items oi ON oi.order_id=o.id
+      LEFT JOIN products p ON p.id=oi.product_id
+      LEFT JOIN inventory i ON i.product_id=oi.product_id
+      WHERE ${where.join(" AND ")}
+      GROUP BY o.id, oi.id, p.id
+      HAVING balance_qty > 0
+      ORDER BY p.vehicle_model, p.cover_color, p.sku
+    `, params);
+    const enriched = rows.map(r => {
+      const balance = Number(r.balance_qty || 0), stock = Number(r.available_stock || 0);
+      const shortage = Math.max(0, balance - stock);
+      const status = stock <= 0 ? "OUT_OF_STOCK" : shortage > 0 ? "PARTIAL_STOCK" : "READY_TO_SHIP";
+      return { ...r, shortage_qty: shortage, stock_status: status };
+    }).filter(r => !stock_status || stock_status === "ALL" || r.stock_status === stock_status);
+    function groupBy(field) {
+      const map = {};
+      for (const r of enriched) {
+        const key = r[field] || "-";
+        if (!map[key]) map[key] = { key, pending_qty: 0, shortage_qty: 0, item_count: 0 };
+        map[key].pending_qty += Number(r.balance_qty || 0);
+        map[key].shortage_qty += Number(r.shortage_qty || 0);
+        map[key].item_count += 1;
+      }
+      return Object.values(map).sort((a,b)=>b.pending_qty-a.pending_qty);
+    }
+    const orderSet = new Set(enriched.map(x=>x.order_pk));
+    res.json({
+      totals: {
+        pending_orders: orderSet.size,
+        pending_qty: enriched.reduce((s,x)=>s+Number(x.balance_qty||0),0),
+        available_qty: enriched.reduce((s,x)=>s+Number(x.available_stock||0),0),
+        shortage_qty: enriched.reduce((s,x)=>s+Number(x.shortage_qty||0),0)
+      },
+      vehicle_summary: groupBy("vehicle_model"),
+      color_summary: groupBy("cover_color"),
+      sticker_summary: groupBy("sticker_code"),
+      category_summary: groupBy("category"),
+      items: enriched
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Evidence upload
+app.post("/api/v1/order-items/:id/media", authRequired, requirePermission("orders:update"), commercialUpload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "file required" });
+    const media_type = String(req.file.mimetype || "").startsWith("video") ? "video" : "photo";
+    const file_url = "/uploads/" + req.file.filename;
+    const [r] = await pool.execute(
+      "INSERT INTO order_item_media (order_item_id, media_type, file_url, file_name, file_size, mime_type, uploaded_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      [req.params.id, media_type, file_url, req.file.originalname, req.file.size, req.file.mimetype, req.user.id]
+    );
+    res.json({ success: true, id: r.insertId, file_url, media_type });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get("/api/v1/order-items/:id/media", authRequired, requirePermission("orders:read"), async (req, res) => {
+  try { res.json(await query("SELECT * FROM order_item_media WHERE order_item_id=? ORDER BY uploaded_at DESC", [req.params.id])); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+// =================== END COMMERCIAL UPDATE PACKAGE V1 CORE ===================
 
 app.listen(PORT, () => console.log(`API running on port ${PORT}`));
